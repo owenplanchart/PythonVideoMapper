@@ -1,0 +1,19 @@
+# Ignore virtual environments
+venv/
+MyEnv2/
+
+# Ignore video and large media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# macOS system files
+.DS_Store
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
