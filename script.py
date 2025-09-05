@@ -27,10 +27,6 @@ quad_vertices = np.array([
     [-1, -1,  0],  # Bottom-left
 ], dtype=np.float32)
 
-tex_coords = np.array([
-    [0, 1], [1, 1], [1, 0], [0, 0]
-], dtype=np.float32)
-
 indices = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
 
 # GLSL 1.20 for older macOS/OpenGL 2.1
@@ -38,11 +34,8 @@ VERTEX_SHADER = """
 #version 120
 
 attribute vec3 position;
-attribute vec2 texCoord;
-varying vec2 fragTexCoord;
 
 void main() {
-    fragTexCoord = texCoord;
     gl_Position = vec4(position, 1.0);
 }
 """
@@ -50,11 +43,16 @@ void main() {
 FRAGMENT_SHADER = """
 #version 120
 
-varying vec2 fragTexCoord;
 uniform sampler2D videoTexture;
+uniform mat3 H; // maps window coords (x,y,1) -> texture uvw - fixes triangle seam
 
 void main() {
-    gl_FragColor = texture2D(videoTexture, fragTexCoord);
+    vec3 uvw = H * vec3(gl_FragCoord.xy, 1.0);
+    float w = uvw.z;
+    if (w == 0.0) discard;
+    vec2 uv = uvw.xy / w;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) discard;
+    gl_FragColor = texture2D(videoTexture, uv);
 }
 """
 
@@ -76,7 +74,6 @@ glAttachShader(shader, frag_shader)
 # position -> location 0
 # texCoord -> location 1
 glBindAttribLocation(shader, 0, "position")
-glBindAttribLocation(shader, 1, "texCoord")
 
 # Link the program
 glLinkProgram(shader)
@@ -86,16 +83,12 @@ if not link_status:
     print("Shader Link Error:\n", log.decode())
 
 # Create Buffers (NO VAO, to support OpenGL 2.1)
-VBOs = glGenBuffers(2)
+VBOs = glGenBuffers(1)
 EBO = glGenBuffers(1)
 
 # Fill Position Buffer
-glBindBuffer(GL_ARRAY_BUFFER, VBOs[0])
+glBindBuffer(GL_ARRAY_BUFFER, VBOs)
 glBufferData(GL_ARRAY_BUFFER, quad_vertices.nbytes, quad_vertices, GL_DYNAMIC_DRAW)
-
-# Fill Texture Coordinate Buffer
-glBindBuffer(GL_ARRAY_BUFFER, VBOs[1])
-glBufferData(GL_ARRAY_BUFFER, tex_coords.nbytes, tex_coords, GL_STATIC_DRAW)
 
 # Fill Index Buffer
 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO)
@@ -110,7 +103,7 @@ selected_corner = 0
 
 def update_vertices():
     # Update position buffer
-    glBindBuffer(GL_ARRAY_BUFFER, VBOs[0])
+    glBindBuffer(GL_ARRAY_BUFFER, VBOs)
     glBufferSubData(GL_ARRAY_BUFFER, 0, quad_vertices.nbytes, quad_vertices)
 
 def move_corner(dx, dy):
@@ -121,6 +114,27 @@ def move_corner(dx, dy):
 
 running = True
 clock = pygame.time.Clock()
+
+# Helper: convert current NDC vertices to window coordinates (origin bottom-left)
+def quad_vertices_to_window_coords(vertices_ndc: np.ndarray, w: int, h: int) -> np.ndarray:
+    # NDC [-1,1] -> window coords [0,w],[0,h] with bottom-left origin
+    x = (vertices_ndc[:, 0] * 0.5 + 0.5) * w
+    y = (vertices_ndc[:, 1] * 0.5 + 0.5) * h
+    return np.stack([x, y], axis=1).astype(np.float32)
+
+# Predefine destination UVs in [0,1] matching vertex order
+dst_uv = np.array([
+    [0.0, 1.0],  # Top-left corresponds to v=1 due to flipped texture upload
+    [1.0, 1.0],  # Top-right
+    [1.0, 0.0],  # Bottom-right
+    [0.0, 0.0],  # Bottom-left
+], dtype=np.float32)
+
+# Uniform locations
+glUseProgram(shader)
+u_tex = glGetUniformLocation(shader, "videoTexture")
+u_H = glGetUniformLocation(shader, "H")
+glUniform1i(u_tex, 0)  # texture unit 0
 
 while running:
     for event in pygame.event.get():
@@ -163,18 +177,25 @@ while running:
     # Use our shader
     glUseProgram(shader)
 
+    # Compute homography from window coords -> UV
+    src_window = quad_vertices_to_window_coords(quad_vertices, width, height)
+    # OpenCV expects points in order: tl, tr, br, bl — which matches our array
+    H_cv = cv2.getPerspectiveTransform(src_window.astype(np.float32), dst_uv.astype(np.float32))
+    # Upload as mat3; OpenGL expects column-major. Pass transpose=True to convert row-major -> column-major
+    H_mat3 = np.array([
+        [H_cv[0,0], H_cv[0,1], H_cv[0,2]],
+        [H_cv[1,0], H_cv[1,1], H_cv[1,2]],
+        [H_cv[2,0], H_cv[2,1], H_cv[2,2]],
+    ], dtype=np.float32)
+    glUniformMatrix3fv(u_H, 1, True, H_mat3)
+
     # Bind the index buffer
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO)
 
     # Setup position attribute
-    glBindBuffer(GL_ARRAY_BUFFER, VBOs[0])
+    glBindBuffer(GL_ARRAY_BUFFER, VBOs)
     glEnableVertexAttribArray(0)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
-
-    # Setup texture coordinate attribute
-    glBindBuffer(GL_ARRAY_BUFFER, VBOs[1])
-    glEnableVertexAttribArray(1)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, None)
 
     # Draw
     glDrawElements(GL_TRIANGLES, len(indices), GL_UNSIGNED_INT, None)
